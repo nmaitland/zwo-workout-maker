@@ -35,7 +35,8 @@ class Segment:
 @dataclass
 class Workout:
     """A parsed workout ready for ZWO generation."""
-    name: str
+    name: str  # filename-safe identifier (e.g. Threshold_2x10_1h30m)
+    display_name: str  # human-readable name for ZWO <name> element
     description: str
     segments: list[Segment] = field(default_factory=list)
     source_text: str = ""

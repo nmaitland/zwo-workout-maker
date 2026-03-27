@@ -7,21 +7,41 @@ DASH = r'[\u2013\-]'
 TIMES = r'[x\xd7]'
 
 # Populated at runtime by load_power_zones()
-POWER_ZONES: list[tuple[int, int, str]] = []
+# Each entry: (low_ftp_fraction, high_ftp_fraction, zone_name)
+POWER_ZONES: list[tuple[float, float, str]] = []
 
 
 def load_power_zones(csv_path: str):
-    """Load zone definitions from power-mappings.csv."""
+    """Load zone definitions from power-mappings.csv.
+
+    Supports both formats:
+      - '60-70% FTP' (preferred)
+      - '120-140 W' (legacy)
+    """
     POWER_ZONES.clear()
-    with open(csv_path, newline='', encoding='cp1252') as f:
+    with open(csv_path, newline='', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
             name = row["Session type"].strip().replace(" ", "")
             target = row["Typical target"].strip()
-            # Parse "120–140 W" - handle en-dash, hyphen, and encoding artifacts
+            # Try % FTP format first: "60-70% FTP"
+            m = re.search(r'(\d+)\s*-\s*(\d+)\s*%', target)
+            if m:
+                POWER_ZONES.append((int(m.group(1)) / 100, int(m.group(2)) / 100, name))
+                continue
+            # Legacy watts format: "120-140 W"
             m = re.search(r'(\d+)\s*\D+\s*(\d+)', target)
             if m:
-                POWER_ZONES.append((int(m.group(1)), int(m.group(2)), name))
+                low_w, high_w = int(m.group(1)), int(m.group(2))
+                POWER_ZONES.append((low_w / models.FTP, high_w / models.FTP, name))
+
+
+def _zone_power(name: str) -> float:
+    """Look up a zone name and return its midpoint FTP fraction."""
+    for low, high, zname in POWER_ZONES:
+        if zname == name:
+            return round((low + high) / 2, 2)
+    return models.Z2_POWER
 
 
 def watts_to_ftp(watts: int) -> float:
@@ -33,13 +53,12 @@ def midpoint(low: int, high: int) -> float:
 
 
 def zone_name(power_ftp: float) -> str:
-    """Map an models.FTP fraction to the closest zone name from power-mappings.csv."""
-    watts = power_ftp * models.FTP
+    """Map an FTP fraction to the closest zone name from power-mappings.csv."""
     best_name = "Endurance"
     best_dist = float('inf')
     for low, high, name in POWER_ZONES:
         mid = (low + high) / 2
-        dist = abs(watts - mid)
+        dist = abs(power_ftp - mid)
         if dist < best_dist:
             best_dist = dist
             best_name = name
@@ -47,7 +66,7 @@ def zone_name(power_ftp: float) -> str:
 
 
 def parse_power_range(text: str) -> float:
-    """Parse '120-140 W' or '145' into models.FTP fraction."""
+    """Parse '120-140 W' or '145' into FTP fraction."""
     m = re.search(rf'(\d+)\s*{DASH}\s*(\d+)\s*W?', text)
     if m:
         return midpoint(int(m.group(1)), int(m.group(2)))
@@ -81,7 +100,7 @@ def is_skip(text: str) -> bool:
         return True
     skip_patterns = [
         r'^rest',
-        r'travel',
+        r'^travel',
         r'no ride',
     ]
     return any(re.search(p, t) for p in skip_patterns)
@@ -94,8 +113,24 @@ def strip_prefix(text: str) -> str:
     return text.strip()
 
 
+def _expand_zone_names(text: str) -> str:
+    """Replace zone names with their watt ranges for pattern matching.
+
+    e.g. 'Endurance (2.5 h)' -> 'Endurance 120-140 W (2.5 h)'
+         '3×10 Threshold (1.5 h)' -> '3×10 Threshold 200-210 W (1.5 h)'
+    """
+    for low_ftp, high_ftp, name in POWER_ZONES:
+        low_w = round(low_ftp * models.FTP)
+        high_w = round(high_ftp * models.FTP)
+        watts = f"{low_w}-{high_w} W"
+        # Insert watt range after zone name, only if not already followed by a digit
+        text = re.sub(rf'\b{name}\b(?!\s+\d)', f'{name} {watts}', text)
+    return text
+
+
 def _make_interval_workout(total_sec: int, repeat: int, on_min: int,
-                           on_power: float, name: str, desc: str, source: str) -> Workout:
+                           on_power: float, name: str, display_name: str,
+                           desc: str, source: str) -> Workout:
     """Build a workout with Z2 filler + interval block, placing intervals per the 20-min rule."""
     on_dur = on_min * 60
     off_dur = on_dur // 2
@@ -120,7 +155,7 @@ def _make_interval_workout(total_sec: int, repeat: int, on_min: int,
     if filler_after > 0:
         segments.append(Segment(kind="steady", duration_sec=filler_after, power=models.Z2_POWER))
 
-    return Workout(name=name, description=desc, segments=segments, source_text=source)
+    return Workout(name=name, display_name=display_name, description=desc, segments=segments, source_text=source)
 
 
 def parse_description(text: str) -> Workout | None:
@@ -130,31 +165,18 @@ def parse_description(text: str) -> Workout | None:
         return None
     source = text
     text = strip_prefix(text)
+    text = _expand_zone_names(text)
 
-    # Pattern A: "{dur} incl. {N}x{M} @ {pow}" - endurance with embedded intervals
+    # Pattern B: "{dur_range} min {zone} {pow} ({total})" - sustained block in endurance ride
+    # e.g. "60-90 min Tempo 150-160 W (4 h)"
     m = re.search(
-        rf'(\d+(?:\.\d+)?\s*(?:h|min))\s+.*?incl\.\s*(\d+)\s*{TIMES}\s*(\d+)\s*(?:min\s*)?@\s*(\d+)\s*{DASH}\s*(\d+)\s*W',
+        rf'(\d+)\s*{DASH}\s*(\d+)\s*min\s+\w+\s+(\d+)\s*{DASH}\s*(\d+)\s*W\s*\(([^)]+)\)',
         text
     )
     if m:
-        total_sec = parse_duration(m.group(1))
-        repeat = int(m.group(2))
-        on_min = int(m.group(3))
-        on_power = midpoint(int(m.group(4)), int(m.group(5)))
-        zn = zone_name(on_power)
-        name = f"Endurance_{_format_dur(total_sec)}_with_{repeat}x{on_min}min_{zn}"
-        return _make_interval_workout(total_sec, repeat, on_min, on_power, name,
-                                      f"Endurance ride with {repeat}x{on_min} min {zn} intervals", source)
-
-    # Pattern B: "{dur} Z2 incl. {dur_range} @ {pow}" - endurance with sustained tempo block
-    m = re.search(
-        rf'(\d+(?:\.\d+)?\s*(?:h|min)).*?incl\.\s*(\d+)\s*{DASH}\s*(\d+)\s*min\s*@\s*(\d+)\s*{DASH}\s*(\d+)\s*W',
-        text
-    )
-    if m:
-        total_sec = parse_duration(m.group(1))
-        tempo_sec = int(m.group(3)) * 60  # use higher duration
-        tempo_power = midpoint(int(m.group(4)), int(m.group(5)))
+        tempo_sec = int(m.group(2)) * 60  # use higher duration
+        tempo_power = midpoint(int(m.group(3)), int(m.group(4)))
+        total_sec = parse_duration(m.group(5))
         overhead = models.WARMUP_DURATION + models.COOLDOWN_DURATION
         main_sec = max(total_sec - overhead, tempo_sec)
         z2_before = min(models.INTERVAL_PLACEMENT_OFFSET, main_sec - tempo_sec)
@@ -169,40 +191,17 @@ def parse_description(text: str) -> Workout | None:
             segments.append(Segment(kind="steady", duration_sec=z2_after, power=models.Z2_POWER))
 
         zn = zone_name(tempo_power)
-        name = f"Endurance_{_format_dur(total_sec)}_with_{zn}"
-        return Workout(name=name, description=f"Endurance with sustained {zn} block",
+        block_min = int(m.group(2))
+        name = f"{zn}_{block_min}min_{_format_dur(total_sec)}"
+        display = f"{zn} {block_min}min {_format_dur(total_sec)}"
+        return Workout(name=name, display_name=display,
+                       description=f"Endurance with sustained {zn} block",
                        segments=segments, source_text=source)
 
-    # Pattern C: "{dur} + {N}x{M} @ {pow}" - long ride plus intervals at end
+    # Pattern D: "{N}x{M} [min] {zone} {pow} ({dur})" - intervals with total duration
+    # e.g. "3×10 Threshold 200-210 W (1.5 h)", "3×3 min SweetSpot 180-190 W (60 min)"
     m = re.search(
-        rf'(\d+(?:\.\d+)?\s*h)\s*\+\s*(\d+)\s*{TIMES}\s*(\d+)\s*@\s*(\d+)\s*{DASH}\s*(\d+)\s*W',
-        text
-    )
-    if m:
-        ride_sec = parse_duration(m.group(1))
-        repeat = int(m.group(2))
-        on_min = int(m.group(3))
-        on_power = midpoint(int(m.group(4)), int(m.group(5)))
-        on_dur = on_min * 60
-        off_dur = on_dur // 2
-        # Z2 portion = stated ride time minus warmup/cooldown
-        z2_sec = max(ride_sec - models.WARMUP_DURATION - models.COOLDOWN_DURATION, 60)
-
-        segments = [
-            Segment(kind="steady", duration_sec=z2_sec, power=models.Z2_POWER),
-            Segment(kind="intervals", repeat=repeat,
-                    on_duration=on_dur, off_duration=off_dur,
-                    on_power=on_power, off_power=models.REST_POWER),
-        ]
-        zn = zone_name(on_power)
-        name = f"Endurance_{_format_dur(ride_sec)}_plus_{repeat}x{on_min}min_{zn}"
-        return Workout(name=name,
-                       description=f"Long endurance ride then {repeat}x{on_min} min {zn} intervals",
-                       segments=segments, source_text=source)
-
-    # Pattern D: "{N}x{M} @ {pow} ({dur})" - pure intervals with total duration
-    m = re.search(
-        rf'(\d+)\s*{TIMES}\s*(\d+)\s*(?:or\s+\d+{TIMES}\d+\s*)?@\s*(\d+)\s*{DASH}\s*(\d+)\s*W\s*\(([^)]+)\)',
+        rf'(\d+)\s*{TIMES}\s*(\d+)\s*(?:min\s+)?(?:or\s+\d+{TIMES}\d+\s+)?\w+\s+(\d+)\s*{DASH}\s*(\d+)\s*W\s*\(([^)]+)\)',
         text
     )
     if m:
@@ -211,35 +210,16 @@ def parse_description(text: str) -> Workout | None:
         on_power = midpoint(int(m.group(3)), int(m.group(4)))
         total_sec = parse_duration(m.group(5))
         zn = zone_name(on_power)
-        name = f"{repeat}x{on_min}min_{zn}_{_format_dur(total_sec)}"
+        name = f"{zn}_{repeat}x{on_min}_{_format_dur(total_sec)}"
+        display = f"{zn} {repeat}x{on_min} {_format_dur(total_sec)}"
+        desc = f"{repeat}x{on_min} min {zn} intervals"
         return _make_interval_workout(total_sec, repeat, on_min, on_power, name,
-                                      f"{repeat}x{on_min} min {zn} intervals", source)
+                                      display, desc, source)
 
-    # Pattern E: "{dur} steady; final {dur} @ {pow}" - compound with finishing block
-    m = re.search(
-        rf'(\d+(?:\.\d+)?\s*h)\s+steady;?\s*final\s+(\d+)\s*min\s*@\s*(\d+)\s*{DASH}\s*(\d+)\s*W',
-        text
-    )
-    if m:
-        total_sec = parse_duration(m.group(1))
-        finish_sec = int(m.group(2)) * 60
-        finish_power = midpoint(int(m.group(3)), int(m.group(4)))
-        overhead = models.WARMUP_DURATION + models.COOLDOWN_DURATION
-        z2_sec = max(total_sec - overhead - finish_sec, 0)
-
-        segments = []
-        if z2_sec > 0:
-            segments.append(Segment(kind="steady", duration_sec=z2_sec, power=models.Z2_POWER))
-        segments.append(Segment(kind="steady", duration_sec=finish_sec, power=finish_power))
-
-        zn = zone_name(finish_power)
-        name = f"Endurance_{_format_dur(total_sec)}_finish_{zn}"
-        return Workout(name=name, description=f"Endurance ride with final {m.group(2)} min {zn} finish",
-                       segments=segments, source_text=source)
-
-    # Pattern F: "{Zone} {pow} ({dur})" - zone with power and duration
-    m = re.search(
-        rf'(?:Z[12]|Endurance|Tempo)\s+(\d+)\s*{DASH}\s*(\d+)\s*W\s*\(([^)]+)\)',
+    # Pattern F: "{Zone} {pow} ({dur})" - simple steady state (anchored to start)
+    # e.g. "Endurance 120-140 W (2.5 h)", "Tempo 150-160 W (2 h)", "Recovery 100-110 W (1 h)"
+    m = re.match(
+        rf'(?:Recovery|Endurance|Tempo|SweetSpot|Threshold|Z[12])\s+(\d+)\s*{DASH}\s*(\d+)\s*W\s*\(([^)]+)\)',
         text
     )
     if m:
@@ -247,52 +227,35 @@ def parse_description(text: str) -> Workout | None:
         total_sec = parse_duration(m.group(3))
         overhead = models.WARMUP_DURATION + models.COOLDOWN_DURATION
         main_sec = max(total_sec - overhead, 60)
-        zone = "Tempo" if "empo" in text else "Z2"
 
         segments = [Segment(kind="steady", duration_sec=main_sec, power=power)]
         zn = zone_name(power)
         name = f"{zn}_{_format_dur(total_sec)}"
-        return Workout(name=name, description=f"{zn} session",
+        display = f"{zn} {_format_dur(total_sec)}"
+        return Workout(name=name, display_name=display, description=f"{zn} session",
                        segments=segments, source_text=source)
 
-    # Pattern G: "{dur} {Zone} {pow}" - duration then zone and power
-    m = re.search(
-        rf'(\d+(?:\.\d+)?\s*(?:h|min))\s+(?:Z[12]|easy)\s+(\d+)\s*{DASH}\s*(\d+)\s*W',
-        text
-    )
+    # Pattern H: "{dist} km {zone} {pow}" - distance based
+    # e.g. "130 km Tempo 150-160 W", "340 km Endurance 120-140 W"
+    m = re.search(rf'(\d+)\s*km\s+\w+\s+(\d+)\s*{DASH}\s*(\d+)\s*W', text)
     if m:
-        total_sec = parse_duration(m.group(1))
+        dist_km = int(m.group(1))
+        total_sec = int(dist_km / 30 * 3600)  # assume 30 km/h
         power = midpoint(int(m.group(2)), int(m.group(3)))
         overhead = models.WARMUP_DURATION + models.COOLDOWN_DURATION
         main_sec = max(total_sec - overhead, 60)
 
         segments = [Segment(kind="steady", duration_sec=main_sec, power=power)]
         zn = zone_name(power)
-        name = f"{zn}_{_format_dur(total_sec)}"
-        return Workout(name=name, description=f"{zn} ride",
+        name = f"{zn}_{dist_km}km"
+        display = f"{zn} {dist_km}km"
+        return Workout(name=name, display_name=display, description=f"{dist_km}km {zn} ride",
                        segments=segments, source_text=source)
 
-    # Pattern H: "{dist}km @ {pow}" - distance based
-    m = re.search(rf'(\d+)\s*km\s*@\s*(\d+)(?:\s*{DASH}\s*(\d+))?\s*W?', text)
-    if m:
-        dist_km = int(m.group(1))
-        total_sec = int(dist_km / 30 * 3600)  # assume 30 km/h
-        if m.group(3):
-            power = midpoint(int(m.group(2)), int(m.group(3)))
-        else:
-            power = watts_to_ftp(int(m.group(2)))
-        overhead = models.WARMUP_DURATION + models.COOLDOWN_DURATION
-        main_sec = max(total_sec - overhead, 60)
-
-        segments = [Segment(kind="steady", duration_sec=main_sec, power=power)]
-        zn = zone_name(power)
-        name = f"Ride_{dist_km}km_{zn}"
-        return Workout(name=name, description=f"{dist_km}km {zn} ride",
-                       segments=segments, source_text=source)
-
-    # Pattern I: duration with zone qualifier (no explicit power) - "Z2 4-5h", "long Z2 4 h"
+    # Pattern I: duration with optional qualifier (fallback)
+    # e.g. "Z2 4.5 h", "2 h easy", "1 h recovery spin"
     m = re.search(
-        rf'(?:long\s+)?(?:Z[12]\s+)?(\d+(?:\.\d+)?)\s*(?:{DASH}\s*(\d+(?:\.\d+)?)\s*)?(h|min)',
+        rf'(?:long\s+)?(?:(?:Z[12]|Endurance|Recovery)\s+)?(\d+(?:\.\d+)?)\s*(?:{DASH}\s*(\d+(?:\.\d+)?)\s*)?(h|min)',
         text
     )
     if m:
@@ -310,9 +273,10 @@ def parse_description(text: str) -> Workout | None:
         main_sec = max(total_sec - overhead, 60)
 
         segments = [Segment(kind="steady", duration_sec=main_sec, power=power)]
-        label = "Recovery" if power == models.RECOVERY_POWER else "Z2"
+        label = "Recovery" if power == models.RECOVERY_POWER else "Endurance"
         name = f"{label}_{_format_dur(total_sec)}"
-        return Workout(name=name, description=f"{label} ride",
+        display = f"{label} {_format_dur(total_sec)}"
+        return Workout(name=name, display_name=display, description=f"{label} ride",
                        segments=segments, source_text=source)
 
     # Fallback: couldn't parse, skip with a warning

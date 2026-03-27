@@ -25,7 +25,7 @@ def build_zwo(workout: Workout) -> str:
     """Convert a Workout into a ZWO XML string."""
     root = ET.Element("workout_file")
     ET.SubElement(root, "author").text = "Training Plan Generator"
-    ET.SubElement(root, "name").text = workout.name
+    ET.SubElement(root, "name").text = workout.display_name
     ET.SubElement(root, "description").text = workout.description
     ET.SubElement(root, "sportType").text = "bike"
 
