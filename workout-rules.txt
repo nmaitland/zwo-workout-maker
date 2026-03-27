@@ -1,0 +1,9 @@
+- Workouts should be a percentage, not raw wattage, and calculated from the spreadsheet based on my current FTP of 200W.
+- All workouts should have a 10 min warm up ramping from 100W to 140W.
+- All workouts should have a 3 min cooldown, ramping from 100W to 80W.
+- Main part of any workout may not have any sections more then 5 mins long at the same power. When sections need to be longer they should use over-unders of sensible intervals (eg 2 mins) at target + 5% then target -5%.
+- Workouts with interval sessions should have a break of 50% of each interval period at 60% of FTP.
+- Non-cycling days such as Rest, Travel etc, do not require output zwo files
+- Duplicate sessions in duration and content should have only one zwo file.
+- The zwo filename should indicate the session content, and the description can provide more useful info
+- If you want to think like a cycling coach you can add motivational comments at key points during sessions using the appropriate zwift tags!

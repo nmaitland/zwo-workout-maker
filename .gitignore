@@ -1,0 +1,7 @@
+output/
+power-mappings.csv
+training-plan.csv
+training-plan.xlsx
+__pycache__/
+*.pyc
+.claude/plans/
