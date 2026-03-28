@@ -1,5 +1,6 @@
 import xml.etree.ElementTree as ET
 import xml.dom.minidom
+from metrics import format_metrics
 from models import (
     Workout, Segment,
     WARMUP_DURATION, WARMUP_LOW, WARMUP_HIGH,
@@ -8,16 +9,69 @@ from models import (
     FTP,
 )
 
-COACHING_MESSAGES = {
-    "warmup_start": "Easy spin to get the legs going",
-    "warmup_mid": "Gradually building into the session",
-    "interval_first": "First interval - find your rhythm and settle in",
-    "interval_mid": "Halfway through the hard efforts! Stay strong",
-    "interval_last": "Final interval - make it count!",
-    "steady_start": "Settle in, keep it smooth and consistent",
-    "steady_mid": "Halfway through this block - you are doing great",
-    "near_end": "Nearly there, stay focused to the finish",
-    "cooldown": "Great work! Spin the legs out easy",
+WARMUP_MESSAGES = (
+    "Light hands, loose shoulders, and let the flywheel come to you",
+    "Build pressure through the whole pedal stroke, like smoothing wet paint",
+)
+
+COOLDOWN_MESSAGE = "Exhale, soften the grip, and let the legs come back under you"
+
+RECOVERY_MESSAGES = (
+    "Back off, drop the shoulders, and make every breath long and quiet",
+    "Easy speed now. Let the heart rate fall while the legs keep turning cleanly",
+    "Reset the posture: tall spine, soft elbows, relaxed jaw",
+)
+
+ENDURANCE_MESSAGES = {
+    "start": (
+        "Ride like you could do this all day: quiet upper body, steady chain",
+        "Think diesel engine: calm breathing, even pressure, no wasted motion",
+    ),
+    "mid": (
+        "Keep the hips still and draw smooth circles through the bottom of the stroke",
+        "Imagine a long valley road: patient pace, relaxed hands, rhythm first",
+    ),
+}
+
+TEMPO_MESSAGES = {
+    "start": (
+        "Tempo is controlled pressure: tall torso, firm core, and no stomping",
+        "Sit proud over the bottom bracket and let the cadence stay honest",
+    ),
+    "mid": (
+        "Stay just under the red line. Smooth face, heavy legs, calm breathing",
+        "Picture a steady climb you can see for miles: committed, never rushed",
+    ),
+}
+
+THRESHOLD_MESSAGES = {
+    "first": (
+        "First rep: lock into the effort early and keep the torso quiet",
+        "Ride the line, not above it. Strong core, smooth breathing, eyes up",
+    ),
+    "mid": (
+        "Hold form under load: elbows soft, chin still, power driven from the hips",
+        "This is the hard, honest work. Keep the pressure even and the mind narrow",
+    ),
+    "last": (
+        "Final rep: stay tall, keep the pedals turning over, and squeeze every clean watt",
+        "Think of cresting the last rise without fading: brave legs, calm head",
+    ),
+}
+
+SWEETSPOT_MESSAGES = {
+    "first": (
+        "Sweet spot should feel firm, not frantic. Stay seated and keep the cadence round",
+        "Settle into sustainable pressure and let the effort come to you",
+    ),
+    "mid": (
+        "Heavy but controlled. Breathe into the belly and keep the upper body quiet",
+        "Imagine a long false flat with no surges, just steady intent",
+    ),
+    "last": (
+        "Final block: same patience, same posture, no heroics",
+        "Stay smooth to the end and make the last minutes look the most composed",
+    ),
 }
 
 
@@ -26,7 +80,10 @@ def build_zwo(workout: Workout) -> str:
     root = ET.Element("workout_file")
     ET.SubElement(root, "author").text = "Training Plan Generator"
     ET.SubElement(root, "name").text = workout.display_name
-    ET.SubElement(root, "description").text = workout.description
+    description = workout.description
+    if workout.metrics is not None:
+        description = f"{description} | {format_metrics(workout.metrics)}"
+    ET.SubElement(root, "description").text = description
     ET.SubElement(root, "sportType").text = "bike"
 
     wo = ET.SubElement(root, "workout")
@@ -36,8 +93,8 @@ def build_zwo(workout: Workout) -> str:
                            Duration=str(WARMUP_DURATION),
                            PowerLow=f"{WARMUP_LOW:.2f}",
                            PowerHigh=f"{WARMUP_HIGH:.2f}")
-    _add_text(warmup, 0, COACHING_MESSAGES["warmup_start"])
-    _add_text(warmup, WARMUP_DURATION // 2, COACHING_MESSAGES["warmup_mid"])
+    _add_text(warmup, 0, WARMUP_MESSAGES[0])
+    _add_text(warmup, WARMUP_DURATION // 2, WARMUP_MESSAGES[1])
 
     # Main segments
     time_offset = WARMUP_DURATION
@@ -55,18 +112,20 @@ def build_zwo(workout: Workout) -> str:
                              Duration=str(COOLDOWN_DURATION),
                              PowerLow=f"{COOLDOWN_LOW:.2f}",
                              PowerHigh=f"{COOLDOWN_HIGH:.2f}")
-    _add_text(cooldown, 0, COACHING_MESSAGES["cooldown"])
+    _add_text(cooldown, 0, COOLDOWN_MESSAGE)
 
     return _prettify(root)
 
 
 def _emit_steady(wo: ET.Element, seg: Segment, time_offset: int) -> int:
     """Emit a steady segment, converting to over-unders if longer than threshold."""
+    start_msg, mid_msg = _steady_messages(seg.power)
+
     if seg.duration_sec <= OVER_UNDER_THRESHOLD:
         el = ET.SubElement(wo, "SteadyState",
                            Duration=str(seg.duration_sec),
                            Power=f"{seg.power:.2f}")
-        _add_text(el, 0, COACHING_MESSAGES["steady_start"])
+        _add_text(el, 0, start_msg)
         return time_offset + seg.duration_sec
 
     # Convert to over-unders
@@ -83,9 +142,9 @@ def _emit_steady(wo: ET.Element, seg: Segment, time_offset: int) -> int:
                            OffDuration=str(OVER_UNDER_BLOCK),
                            OnPower=f"{over_power:.2f}",
                            OffPower=f"{under_power:.2f}")
-        _add_text(el, 0, COACHING_MESSAGES["steady_start"])
+        _add_text(el, 0, start_msg)
         mid_time = (full_cycles // 2) * cycle
-        _add_text(el, mid_time, COACHING_MESSAGES["steady_mid"])
+        _add_text(el, mid_time, mid_msg)
         time_offset += full_cycles * cycle
 
     if remainder > 0:
@@ -99,6 +158,8 @@ def _emit_steady(wo: ET.Element, seg: Segment, time_offset: int) -> int:
 
 def _emit_intervals(wo: ET.Element, seg: Segment, time_offset: int) -> int:
     """Emit an interval block. If ON duration > 5 min, apply over-unders within each interval."""
+    first_msg, mid_msg, last_msg = _interval_messages(seg.on_power)
+
     if seg.on_duration <= OVER_UNDER_THRESHOLD:
         # Short intervals - use simple IntervalsT
         el = ET.SubElement(wo, "IntervalsT",
@@ -108,13 +169,13 @@ def _emit_intervals(wo: ET.Element, seg: Segment, time_offset: int) -> int:
                            OnPower=f"{seg.on_power:.2f}",
                            OffPower=f"{seg.off_power:.2f}")
 
-        _add_text(el, 0, COACHING_MESSAGES["interval_first"])
+        _add_text(el, 0, first_msg)
         if seg.repeat > 2:
             mid_interval = (seg.repeat // 2) * (seg.on_duration + seg.off_duration)
-            _add_text(el, mid_interval, COACHING_MESSAGES["interval_mid"])
+            _add_text(el, mid_interval, mid_msg)
         if seg.repeat > 1:
             last_interval = (seg.repeat - 1) * (seg.on_duration + seg.off_duration)
-            _add_text(el, last_interval, COACHING_MESSAGES["interval_last"])
+            _add_text(el, last_interval, last_msg)
 
         total = seg.repeat * (seg.on_duration + seg.off_duration) - seg.off_duration
         return time_offset + total
@@ -128,11 +189,11 @@ def _emit_intervals(wo: ET.Element, seg: Segment, time_offset: int) -> int:
 
         for i in range(seg.repeat):
             if i == 0:
-                msg = COACHING_MESSAGES["interval_first"]
+                msg = first_msg
             elif i == seg.repeat - 1:
-                msg = COACHING_MESSAGES["interval_last"]
+                msg = last_msg
             else:
-                msg = COACHING_MESSAGES["interval_mid"]
+                msg = mid_msg
 
             # Over-under block for this interval
             if full_cycles > 0:
@@ -156,7 +217,7 @@ def _emit_intervals(wo: ET.Element, seg: Segment, time_offset: int) -> int:
                 rest_el = ET.SubElement(wo, "SteadyState",
                                         Duration=str(seg.off_duration),
                                         Power=f"{seg.off_power:.2f}")
-                _add_text(rest_el, 0, "Recovery - easy spinning")
+                _add_text(rest_el, 0, _recovery_message(i))
                 time_offset += seg.off_duration
 
         return time_offset
@@ -175,6 +236,43 @@ def _add_text(parent: ET.Element, timeoffset: int, message: str):
     ET.SubElement(parent, "textevent",
                   timeoffset=str(timeoffset),
                   message=message)
+
+
+def _steady_messages(power: float) -> tuple[str, str]:
+    if power <= 0.58:
+        return (
+            "This is genuine recovery. Feather the pedals and let the body freshen up",
+            "Keep the cadence light and imagine washing the fatigue out of the legs",
+        )
+    if power <= 0.72:
+        return ENDURANCE_MESSAGES["start"][0], ENDURANCE_MESSAGES["mid"][0]
+    if power <= 0.88:
+        return TEMPO_MESSAGES["start"][0], TEMPO_MESSAGES["mid"][0]
+    return SWEETSPOT_MESSAGES["start"][0], SWEETSPOT_MESSAGES["mid"][0]
+
+
+def _interval_messages(power: float) -> tuple[str, str, str]:
+    if power >= 0.98:
+        return (
+            THRESHOLD_MESSAGES["first"][0],
+            THRESHOLD_MESSAGES["mid"][0],
+            THRESHOLD_MESSAGES["last"][0],
+        )
+    if power >= 0.88:
+        return (
+            SWEETSPOT_MESSAGES["first"][0],
+            SWEETSPOT_MESSAGES["mid"][0],
+            SWEETSPOT_MESSAGES["last"][0],
+        )
+    return (
+        TEMPO_MESSAGES["start"][1],
+        TEMPO_MESSAGES["mid"][1],
+        "Last block: stay patient and keep the pressure tidy all the way through",
+    )
+
+
+def _recovery_message(index: int) -> str:
+    return RECOVERY_MESSAGES[index % len(RECOVERY_MESSAGES)]
 
 
 def _prettify(root: ET.Element) -> str:

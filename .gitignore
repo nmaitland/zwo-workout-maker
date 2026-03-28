@@ -1,7 +1,10 @@
 output/
 power-mappings.csv
-training-plan.csv
-training-plan.xlsx
+training-plan*.csv
+training-plan*.xlsx
+intervals-events.json
+intervals-library.json
+intervals-library-plan.json
 __pycache__/
 *.pyc
 .claude/plans/

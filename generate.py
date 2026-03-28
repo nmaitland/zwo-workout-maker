@@ -2,6 +2,7 @@ import argparse
 import csv
 import os
 import re
+from metrics import compute_workout_metrics
 from parser import parse_description, load_power_zones
 from builder import build_zwo
 import models
@@ -9,6 +10,7 @@ from models import Workout
 
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 OUTPUT_DIR = "output"
+CTL_TIME_CONSTANT_DAYS = 42
 
 
 def dedup_key(workout: Workout) -> str:
@@ -34,10 +36,57 @@ def sanitize_filename(name: str) -> str:
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate Zwift .zwo workout files from a training plan CSV")
     parser.add_argument("--ftp", type=int, default=200, help="Functional Threshold Power in watts (default: 200)")
+    parser.add_argument("--starting-ctl", type=float, default=0.0, help="Starting CTL value for weekly ramp calculation (default: 0)")
     parser.add_argument("--prefix", type=str, default="", help="Prefix for output filenames (e.g. 'MyPlan_')")
     parser.add_argument("--plan", type=str, default=None, help="Path to training plan CSV (default: training-plan.csv)")
     parser.add_argument("--mappings", type=str, default=None, help="Path to power mappings CSV (default: power-mappings.csv)")
+    parser.add_argument("--clean-output", action="store_true", help="Delete existing .zwo files from the output directory before generating")
     return parser.parse_args()
+
+
+def split_phase_and_tss(value: str) -> str:
+    return value.split("|", 1)[0].strip()
+
+
+def compute_weekly_ctl_ramp(daily_tss_values: list[list[int]], starting_ctl: float) -> list[float]:
+    ctl = starting_ctl
+    weekly_ramps: list[float] = []
+    alpha = 1 / CTL_TIME_CONSTANT_DAYS
+
+    for week_daily_tss in daily_tss_values:
+        week_start_ctl = ctl
+        for daily_tss in week_daily_tss:
+            ctl += alpha * (daily_tss - ctl)
+        weekly_ramps.append(round(ctl - week_start_ctl, 1))
+
+    return weekly_ramps
+
+
+def rewrite_training_plan(
+    csv_path: str,
+    rows: list[dict[str, str]],
+    weekly_totals: list[int],
+    weekly_ctl_ramps: list[float],
+):
+    fieldnames = ["Week commencing", "Phase", "Weekly TSS", "Weekly CTL Ramp", "Total hours", *DAYS]
+    normalized_rows = []
+
+    for row, weekly_total, weekly_ctl_ramp in zip(rows, weekly_totals, weekly_ctl_ramps):
+        normalized = {
+            "Week commencing": row.get("Week commencing", ""),
+            "Phase": split_phase_and_tss(row.get("Phase / weekly TSS", row.get("Phase", ""))),
+            "Weekly TSS": str(weekly_total),
+            "Weekly CTL Ramp": f"{weekly_ctl_ramp:.1f}",
+            "Total hours": row.get("Total hours", ""),
+        }
+        for day in DAYS:
+            normalized[day] = row.get(day, "")
+        normalized_rows.append(normalized)
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(normalized_rows)
 
 
 def main():
@@ -48,6 +97,15 @@ def main():
     out_dir = os.path.join(script_dir, OUTPUT_DIR)
     os.makedirs(out_dir, exist_ok=True)
 
+    if args.clean_output:
+        removed = 0
+        for name in os.listdir(out_dir):
+            if not name.lower().endswith(".zwo"):
+                continue
+            os.remove(os.path.join(out_dir, name))
+            removed += 1
+        print(f"Removed {removed} existing ZWO files from {OUTPUT_DIR}/")
+
     models.FTP = args.ftp
     load_power_zones(mappings_path)
 
@@ -57,26 +115,41 @@ def main():
 
     with open(csv_path, newline='', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
-        for row in reader:
-            week = row.get("Week commencing", "").strip()
-            if not week:
+        rows = list(reader)
+
+    weekly_totals: list[int] = []
+    daily_tss_values: list[list[int]] = []
+    for row in rows:
+        weekly_total = 0
+        week_daily_tss: list[int] = []
+        for day in DAYS:
+            cell = row.get(day, "").strip()
+            if not cell:
+                week_daily_tss.append(0)
                 continue
-            for day in DAYS:
-                cell = row.get(day, "").strip()
-                if not cell:
-                    continue
 
-                workout = parse_description(cell)
-                if workout is None:
-                    skipped.append(f"  {week} {day}: {cell}")
-                    continue
+            workout = parse_description(cell)
+            if workout is None:
+                skipped.append(f"  {row.get('Week commencing', '').strip()} {day}: {cell}")
+                week_daily_tss.append(0)
+                continue
 
-                key = dedup_key(workout)
-                if key in workouts:
-                    continue
+            workout.metrics = compute_workout_metrics(workout)
+            weekly_total += workout.metrics.training_stress_score
+            week_daily_tss.append(workout.metrics.training_stress_score)
 
-                filename = sanitize_filename(args.prefix + workout.name)
-                workouts[key] = (workout, filename)
+            key = dedup_key(workout)
+            if key in workouts:
+                continue
+
+            filename = sanitize_filename(args.prefix + workout.name)
+            workouts[key] = (workout, filename)
+
+        weekly_totals.append(weekly_total)
+        daily_tss_values.append(week_daily_tss)
+
+    weekly_ctl_ramps = compute_weekly_ctl_ramp(daily_tss_values, args.starting_ctl)
+    rewrite_training_plan(csv_path, rows, weekly_totals, weekly_ctl_ramps)
 
     # Write ZWO files, handling filename collisions
     written = []

@@ -40,3 +40,15 @@ class Workout:
     description: str
     segments: list[Segment] = field(default_factory=list)
     source_text: str = ""
+    metrics: "WorkoutMetrics | None" = None
+
+
+@dataclass
+class WorkoutMetrics:
+    """Calculated ride metrics for a workout."""
+    duration_sec: int
+    average_power: float
+    normalized_power: float
+    intensity_factor: float
+    variability_index: float
+    training_stress_score: int
